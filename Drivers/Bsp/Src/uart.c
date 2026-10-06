@@ -1,234 +1,128 @@
 #include "stm32f407xx.h"
 #include "uart.h"
+#include "gpio.h"
 
-/******************** PRIVATE VARIABLES ********************/
-static char rx_raw_buffer[UART_RX_BUFF_SIZE];
-static uint8_t app_rx_buffer[UART_RX_BUFF_SIZE];
-
-static volatile uint8_t  s_rx_ready = 0;
-static volatile uint16_t s_rx_len   = 0;
-static volatile uint16_t rx_index   = 0;
-
-/******************** FUNCTIONS ********************/
+volatile char buffer[50]; // tao 
+volatile char *rx_ptr = buffer;
+volatile uint8_t rx_index = 0;
+volatile uint8_t rx_ready = 0;
 
 void UART1_Init(void)
 {
-    // 1. Clock GPIOA & USART1
-    RCC->AHB1ENR |= (1U << 0);
-    RCC->APB2ENR |= (1U << 4);
+    //1. cau hinh clock
+    RCC->AHB1ENR |= (1U<<0); // bat clock cho gpio
+    RCC->APB2ENR |= (1U<<4); // bat clock cho uart1.
 
-    // 2. Cấu hình chân PA9 (TX), PA10 (RX) Alternate Function AF7
-    GPIOA->MODER &= ~((3U << 18) | (3U << 20));
-    GPIOA->MODER |=  ((2U << 18) | (2U << 20));
+    //2. cau hinh chan GPIO
+    GPIOA->MODER &= ~(3U<<18); // reset moder cho PA9
+    GPIOA->MODER |= (2U<<18); // bat chuc nang alternative cho chan PA9
+    GPIOA->MODER &= ~(3U<<20); // reset moder cho PA10
+    GPIOA->MODER |= (2U<<20); // bat chuc nang alternative cho chan PA10  
+    
+    GPIOA->OTYPER &= ~(1U<<9);  // bat chuc nang push pull
+    GPIOA->OTYPER &= ~(1U<<10); // bat chuc nang push pull
 
-    GPIOA->OSPEEDR |= ((2U << 18) | (2U << 20)); // High speed
+    GPIOA->OSPEEDR &= ~(3U<<18); // reset speed
+    GPIOA->OSPEEDR |= (2U<<18); // bat high speed
+    GPIOA->OSPEEDR &= ~(3U<<20); // reset speed
+    GPIOA->OSPEEDR |= (2U<<20); // bat high speed
 
-    GPIOA->AFR[1] &= ~((0xFU << 4) | (0xFU << 8));
-    GPIOA->AFR[1] |=  ((7U << 4)  | (7U << 8));
+    GPIOA->AFR[1] &= ~(0xFU<<4);
+    GPIOA->AFR[1] |= (7U<<4); // bat AF7 chuc nang UART1
+    GPIOA->AFR[1] &= ~(0xFU<<8);
+    GPIOA->AFR[1] |= (7U<<8); // bat AF7 chuc nang UART1
 
-    // 3. Cấu hình USART1
-    USART1->CR1 &= ~(1U << 13); // Tắt UE
-    USART1->BRR  = 0x2D9;       // 115200 @ 84MHz (APB2)
+    USART1->CR1 &= ~(1U<<13); // tat UE truoc khi chay
+    USART1->BRR = (0x2D9); // baudrate 115200 @168Mhz
+    USART1->CR1 &= ~(1U<<12); // 1 start bit, 8 data bits, n word length
 
-    // Bật ngắt RXNEIE (bit 5) và IDLEIE (bit 4)
-    USART1->CR1 |= (1U << 5) | (1U << 4);
+    USART1->CR1 |= (1U<<5); // bat nhan ngat
 
-    // Bật TE, RE và UE
-    USART1->CR1 |= (3U << 2) | (1U << 13);
+    USART1->CR1 |= (3U<<2); // bat TE va RE
+    USART1->CR1 |= (1U<<13); // bat UE
 
-    // 4. NVIC
-    NVIC_SetPriority(USART1_IRQn, 1);
-    NVIC_EnableIRQ(USART1_IRQn);
+    // NVIC_EnableIRQ(USART1_IRQn);
+    // NVIC_SetPriority(USART1_IRQn, 2);
 }
 
-uint16_t UART1_ReadPacket(uint8_t *dest, uint16_t max_len)
-{
-    // Kiểm tra an toàn: không có data hoặc mảng đích kích thước 0
-    if (!s_rx_ready || max_len == 0)
-    {
-        return 0;
-    }
+// void USART1_IRQHandler()
+// {
+//     if (USART1->SR & (1U<<5)) // Neu bit so 5 co bat len
+//     {
+//         *rx_ptr = (char)(USART1->DR); // tien hanh chep du lieu trong DR vao tx_data
+//         if (*rx_ptr == '\n' || *rx_ptr == '\r' ||rx_index >= 48)
+//         {
+//             //rx_ptr++;
+//             *rx_ptr = '\0'; // khoa chuoi
+//             rx_ready = 1; // da doc xong
 
-    uint16_t len = (s_rx_len < max_len) ? s_rx_len : max_len;
-    for (uint16_t i = 0; i < len; i++)
-    {
-        dest[i] = app_rx_buffer[i];
-    }
+//             rx_ptr = buffer;
+//             rx_index = 0;
+//         }
+//         else
+//         {
+//             rx_ptr++;
+//             rx_index++;
+//         }
+//     }
+    
+// }
 
-    if (len < max_len)
-    {
-        dest[len] = '\0';
-    }
-    else
-    {
-        dest[max_len - 1] = '\0';
-    }
-
-    s_rx_ready = 0;
-    return len;
-}
-
-void USART1_IRQHandler(void)
-{
-    uint32_t sr = USART1->SR;
-
-    // 1. Giai đoạn lấy từ shifter tới DR, gom vào rx_raw_buffer
-    if (sr & USART_SR_RXNE)
-    {
-        char c = (char)(USART1->DR); // Luôn đọc DR để xóa cờ RXNE
-
-        if (rx_index < (UART_RX_BUFF_SIZE - 1))
-        {
-            rx_raw_buffer[rx_index++] = c;
-        }
-    }
-
-    // 2. Giai đoạn kiểm tra sau khi đã gửi xong gói tin (IDLE)
-    if (sr & USART_SR_IDLE)
-    {
-        // Xóa cờ ngắt IDLE: đọc SR rồi đọc DR
-        (void)USART1->SR;
-        (void)USART1->DR;
-
-        if (rx_index > 0 && !s_rx_ready)
-        {
-            s_rx_len = rx_index;
-            for (uint8_t i = 0; i < s_rx_len; i++)
-            {
-                app_rx_buffer[i] = (uint8_t)rx_raw_buffer[i];
-            }
-            app_rx_buffer[s_rx_len] = '\0';
-
-            s_rx_ready = 1;
-            rx_index = 0;
-        }
-        else if (s_rx_ready)
-        {
-            rx_index = 0; // Reset để đón chu kỳ sau nếu app chưa xử lý kịp
-        }
-    }
-
-    // 3. Xóa cờ lỗi Overrun nếu có
-    if (sr & USART_SR_ORE)
-    {
-        (void)USART1->SR;
-        (void)USART1->DR;
-    }
-}
-
-void Send_String(const char *tx_ptr)
+void Send_String(char *tx_ptr)
 {
     while (*tx_ptr != '\0')
     {
-        while (!(USART1->SR & USART_SR_TXE));
+        while (!(USART1->SR & (1U<<7)));
         USART1->DR = *tx_ptr;
         tx_ptr++;
     }
 }
 
-/**
- * @brief Chuyển đổi số nguyên có dấu thành chuỗi ký tự ASCII
- * @param num  Số cần chuyển
- * @param str  Con trỏ bộ đệm chứa chuỗi kết quả
- */
-void Int_To_String(int32_t num, char *str)
+void Send_Integer(int32_t num)
 {
-    int i = 0;
-    uint8_t is_negative = 0;
+    char numbuffer[12]; //tao 1 mang (0-9), '-', '\0'
+    uint32_t i = 0;
+    uint32_t is_negative = 0;
 
-    /* Xử lý trường hợp số 0 */
     if (num == 0)
     {
-        str[i++] = '0';
-        str[i] = '\0';
+        Send_String("0");
         return;
     }
-
-    /* Xử lý số âm */
     if (num < 0)
     {
         is_negative = 1;
         num = -num;
     }
-
-    /* Tách từng chữ số từ hàng đơn vị ngược lên */
     while (num > 0)
     {
-        str[i++] = (num % 10) + '0';
-        num /= 10;
+        numbuffer[i] = num % 10 + '0';
+        i++;
+        num = num / 10;
     }
-
     if (is_negative)
     {
-        str[i++] = '-';
+        numbuffer[i] = '-';
+        i++;
     }
+    numbuffer[i] = '\0';
 
-    str[i] = '\0';
-
-    /* Đảo ngược chuỗi lại cho đúng thứ tự */
-    int start = 0;
-    int end = i - 1;
-    while (start < end)
+    char *start_numbuffer = numbuffer;
+    char *end_numbuffer = numbuffer + i - 1;
+    while (start_numbuffer < end_numbuffer)
     {
-        char temp = str[start];
-        str[start] = str[end];
-        str[end] = temp;
-        start++;
-        end--;
+        char temp = *start_numbuffer;
+        *start_numbuffer = *end_numbuffer;
+        *end_numbuffer = temp;
+        start_numbuffer++;
+        end_numbuffer--;
     }
+    Send_String(numbuffer);
 }
 
-void UART_Print_Hex16(uint16_t val)
-{
-    const char hex_chars[] = "0123456789ABCDEF";
-    char str[7];
-    str[0] = '0';
-    str[1] = 'x';
-    str[2] = hex_chars[(val >> 12) & 0x0F];
-    str[3] = hex_chars[(val >> 8)  & 0x0F];
-    str[4] = hex_chars[(val >> 4)  & 0x0F];
-    str[5] = hex_chars[val & 0x0F];
-    str[6] = '\0';
-    Send_String(str);
-}
 
-/**
- * @brief In số thực có 1 chữ số thập phân ra chuỗi (ví dụ 30.5)
- * @param val  Giá trị float cần in
- * @param str  Buffer chứa chuỗi kết quả
- */
-void Float_To_String_1Dec(float val, char *str)
-{
-    // Xử lý số âm nếu có
-    if (val < 0.0f)
-    {
-        *str++ = '-';
-        val = -val;
-    }
 
-    // Tách phần nguyên và phần thập phân (1 chữ số sau dấu phẩy)
-    int32_t int_part = (int32_t)val;
-    int32_t dec_part = (int32_t)((val - (float)int_part) * 10.0f + 0.5f); // Làm tròn
 
-    if (dec_part >= 10)
-    {
-        int_part += 1;
-        dec_part = 0;
-    }
 
-    // Đổi phần nguyên
-    char temp[16];
-    Int_To_String(int_part, temp);
 
-    // Ghép phần nguyên
-    char *p = temp;
-    while (*p != '\0')
-    {
-        *str++ = *p++;
-    }
 
-    // Ghép dấu chấm và phần thập phân
-    *str++ = '.';
-    *str++ = dec_part + '0';
-    *str = '\0';
-}
