@@ -1,0 +1,160 @@
+void ATV312_NMT_Start(uint8_t node_id)
+{
+    uint8_t nmt_payload[2] = {0x01, node_id};
+    CAN_Send_Frame(0x000, nmt_payload, 2);
+}
+
+void ATV312_Send_PDO1(uint8_t node_id, uint16_t cmd)
+{
+    uint8_t payload[2];
+    payload[0] = (uint8_t)(cmd & 0xFF);
+    payload[1] = (uint8_t)((cmd >> 8) & 0xFF);
+    CAN_Send_Frame(0x200 + node_id, payload, 2);
+}
+
+void ATV312_Send_PDO6(uint8_t node_id, uint16_t cmd, int16_t speed_ref)
+{
+    uint8_t payload[4];
+    payload[0] = (uint8_t)(cmd & 0xFF);
+    payload[1] = (uint8_t)((cmd >> 8) & 0xFF);
+    payload[2] = (uint8_t)(speed_ref & 0xFF);
+    payload[3] = (uint8_t)((speed_ref >> 8) & 0xFF);
+    CAN_Send_Frame(0x300 + node_id, payload, 4);
+}
+
+void ATV312_SDO_Write16(uint8_t node_id, uint16_t index, uint8_t sub_index, uint16_t value)
+{
+    uint8_t payload[8] = {0};
+    payload[0] = 0x2B;
+    payload[1] = (uint8_t)(index & 0xFF);
+    payload[2] = (uint8_t)((index >> 8) & 0xFF);
+    payload[3] = sub_index;
+    payload[4] = (uint8_t)(value & 0xFF);
+    payload[5] = (uint8_t)((value >> 8) & 0xFF);
+    CAN_Send_Frame(0x600 + node_id, payload, 8);
+}
+
+void ATV312_SDO_Write32(uint8_t node_id, uint16_t index, uint8_t sub_index, uint32_t value)
+{
+    uint8_t payload[8] = {0};
+    payload[0] = 0x23;
+    payload[1] = (uint8_t)(index & 0xFF);
+    payload[2] = (uint8_t)((index >> 8) & 0xFF);
+    payload[3] = sub_index;
+    payload[4] = (uint8_t)(value & 0xFF);
+    payload[5] = (uint8_t)((value >> 8) & 0xFF);
+    payload[6] = (uint8_t)((value >> 16) & 0xFF);
+    payload[7] = (uint8_t)((value >> 24) & 0xFF);
+    CAN_Send_Frame(0x600 + node_id, payload, 8);
+}
+
+
+
+    Delay_ms_TIM2(1000);
+
+    // Bước 1: Khởi động NMT Operational
+    ATV312_NMT_Start(ATV312_NODE_ID);
+    Delay_ms_TIM2(100);
+
+    // Bước 2: Cài đặt dốc gia tốc ACC và giảm tốc dEC = 3.0s
+    ATV312_SDO_Write16(ATV312_NODE_ID, 0x203E, 0x01, 30);          // ACC = 3.0s
+    Delay_ms_TIM2(50);
+    ATV312_SDO_Write16(ATV312_NODE_ID, 0x203E, 0x02, 30);          // dEC = 3.0s
+    Delay_ms_TIM2(50);
+
+    ATV312_SDO_Write32(ATV312_NODE_ID, 0x6048, 0x01, SPEED_50HZ); // ACC delta speed
+    Delay_ms_TIM2(50);
+    ATV312_SDO_Write16(ATV312_NODE_ID, 0x6048, 0x02, 3);           // ACC delta time = 3s
+    Delay_ms_TIM2(50);
+
+    ATV312_SDO_Write32(ATV312_NODE_ID, 0x6049, 0x01, SPEED_50HZ); // DEC delta speed
+    Delay_ms_TIM2(50);
+    ATV312_SDO_Write16(ATV312_NODE_ID, 0x6049, 0x02, 3);           // DEC delta time = 3s
+    Delay_ms_TIM2(50);
+
+    // Bước 3: Chuỗi CiA 402 khởi tạo chuyển sang Enable Operation
+    ATV312_Send_PDO1(ATV312_NODE_ID, 0x0000);
+    Delay_ms_TIM2(100);
+
+    ATV312_Send_PDO1(ATV312_NODE_ID, 0x0006); // Shutdown -> rdY
+    Delay_ms_TIM2(150);
+
+    ATV312_Send_PDO1(ATV312_NODE_ID, 0x0007); // Switch On
+    Delay_ms_TIM2(150);
+
+    ATV312_Send_PDO1(ATV312_NODE_ID, 0x000F); // Enable Operation (cấp nguồn động cơ)
+    Delay_ms_TIM2(150);
+
+    // Mồi giá trị tốc độ ban đầu 1500 (50.0 Hz) vào RAM
+    ATV312_SDO_Write16(ATV312_NODE_ID, 0x6042, 0x00, SPEED_50HZ);
+    Delay_ms_TIM2(50);
+
+    Drive_Sequence_t state = STATE_RUN_FWD;
+    uint32_t state_timer = 0;
+
+    while (1)
+    {
+        switch (state)
+        {
+            case STATE_RUN_FWD:
+                // 1. Chạy thuận 50 Hz trong 10 giây (100 nhịp x 100ms)
+                ATV312_Send_PDO6(ATV312_NODE_ID, 0x000F, SPEED_50HZ);
+                state_timer++;
+                if (state_timer >= 100)
+                {
+                    state_timer = 0;
+                    state = STATE_STOP_FWD;
+                    ATV312_SDO_Write16(ATV312_NODE_ID, 0x6042, 0x00, 0);
+                }
+                break;
+
+            case STATE_STOP_FWD:
+                // 2. Dừng hãm dốc trong 5 giây (hạ về 0.0 trong 3s, giữ đứng yên 2s)
+                ATV312_Send_PDO6(ATV312_NODE_ID, 0x000F, 0);
+                state_timer++;
+                if (state_timer >= 50)
+                {
+                    state_timer = 0;
+                    state = STATE_RUN_REV;
+                    ATV312_SDO_Write16(ATV312_NODE_ID, 0x6042, 0x00, (uint16_t)-SPEED_50HZ);
+                }
+                break;
+
+            case STATE_RUN_REV:
+                // 3. Chạy ngược -50 Hz (-1500) trong 10 giây (100 nhịp x 100ms)
+                ATV312_Send_PDO6(ATV312_NODE_ID, 0x000F, -SPEED_50HZ);
+                state_timer++;
+                if (state_timer >= 100)
+                {
+                    state_timer = 0;
+                    state = STATE_STOP_REV;
+                    ATV312_SDO_Write16(ATV312_NODE_ID, 0x6042, 0x00, 0);
+                }
+                break;
+
+            case STATE_STOP_REV:
+                // 4. Dừng hãm dốc trong 5 giây trước khi tắt hẳn
+                ATV312_Send_PDO6(ATV312_NODE_ID, 0x000F, 0);
+                state_timer++;
+                if (state_timer >= 50)
+                {
+                    state_timer = 0;
+                    state = STATE_POWER_OFF;
+                    
+                    // Giữ nguyên kênh PDO6: chuyển qua 0x0007 rồi về 0x0006
+                    ATV312_Send_PDO6(ATV312_NODE_ID, 0x0007, 0);
+                    Delay_ms_TIM2(100);
+                    ATV312_Send_PDO6(ATV312_NODE_ID, 0x0006, 0);
+                }
+                break;
+
+            case STATE_POWER_OFF:
+                // 5. Kết thúc: Duy trì liên tục bản tin PDO6 (CMD = 0x0006) để chống timeout CAN
+                ATV312_Send_PDO6(ATV312_NODE_ID, 0x0006, 0);
+                break;
+        }
+
+        Toggle_led7();
+        Delay_ms_TIM2(100);
+    }
+}
